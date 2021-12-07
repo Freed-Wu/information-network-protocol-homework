@@ -1,0 +1,21 @@
+digraph G{
+  node[shape=box];
+  subgraph cluster_server{
+    label=server;
+    "socket()" -> "bind()" -> "listen()" -> "accept()" -> "read()" -> "write()"
+      -> "close()";
+  }
+  subgraph cluster_client{
+    label=client;
+    {socket[label="socket()"]} -> "connect()" -> {write[label="write()"]}
+    -> {read[label="read()"]} -> {close[label="close()"]};
+  }
+  {
+    rank=same;
+    "close()";
+     close;
+  }
+  edge[style=dashed, constraint=false];
+  write -> "read()";
+  "write()" -> read;
+}
