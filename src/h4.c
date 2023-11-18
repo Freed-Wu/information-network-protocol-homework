@@ -92,186 +92,76 @@ void *thr_func(void *arg) {
 }
 
 int main(int argc, char **argv) {
-  struct sockaddr_in6 serveraddr = {.sin6_family = AF_INET6,
-                                    .sin6_addr = in6addr_any},
-                      peeraddr;
-  int port = DEFAULT_PORT, sd = -1, blkid, cnt,
-      len = sizeof(struct sockaddr_in6);
+  if (argc < 2)
+  usage:
+    errx(EXIT_FAILURE,
+         "Usage: \n"
+         "  %1$s send ip[:port] filename [speedlimit(KBps)]\n"
+         "  %1$s recv [ip][:port]",
+         argv[0]);
+  // parse ip and port
+  int port = DEFAULT_PORT;
+  char *ip = NULL;
+  if (argc > 2) {
+    ip = argv[2];
+    char *idx = strchr(ip, ']');
+    if (idx && strlen(idx) > 0) {
+      // [ip]:port, strlen("]:") == 2
+      sscanf(idx + 2, "%d", &port);
+      // change [ip]:port to ip\0:port
+      ip++;
+      *idx = '\0';
+    }
+  }
+  struct sockaddr_in6 sa = {.sin6_family = AF_INET6,
+                            .sin6_port = htons(port),
+                            .sin6_addr = in6addr_any},
+                      peer_sa;
+  if (ip != NULL) {
+    switch (inet_pton(AF_INET6, ip, &sa.sin6_addr)) {
+    case -1:
+      err(errno, NULL);
+    case 0:
+      errx(EXIT_FAILURE, "%s is not a valid IPv6 address", ip);
+    }
+  }
+  // parse speedlimit
+  int sendinterval = 0;
+  if (argc > 4) {
+    sscanf(argv[4], "%d", &sendinterval);
+    sendinterval = 500000 / (sendinterval + 8);
+  }
+  // parse command
+  char *filename = "";
+  if (strcasecmp(argv[1], "send") == 0) {
+    if (argc < 4)
+      goto usage;
+    filename = argv[3];
+  } else if (strcasecmp(argv[1], "recv") != 0)
+    goto usage;
+
+  int sd = socket(AF_INET6, SOCK_DGRAM, 0);
+  if (sd == -1)
+    err(errno, NULL);
+
+  int blkid, cnt, len = sizeof(struct sockaddr_in6);
   char buf[BUFF_LEN];
   FILE *fp;
   struct winsize ws;
   pthread_t thr;
   void *thr_arg[2];
   ioctl(0, TIOCGWINSZ, &ws);
-  if (argc < 2)
-    printf("Usage:\n%1$s send ip[:port] filename "
-           "[speedlimit(KBps)]\n%1$s "
-           "recv [port]\n",
-           argv[0]);
-  else if (strcasecmp(argv[1], "send") == 0) {
-    if (argc < 4)
-      printf("Usage: %s send ip[:port] filename "
-             "[speedlimit(KBps)]\n",
-             argv[0]);
-    else {
-      char *ip = argv[2], *ftmp;
-      int ret, acked, sendinterval = 0, ref = 0;
-      struct stat fileinfo;
-      struct timeval tv = {.tv_sec = 1}, tv0 = {}, tv1, tv2;
-      struct timespec nt = {};
-      if (!(fp = fopen(argv[3], "r")))
-        errx(errno, "[\x1B[31m!\x1B[0m] fopen() error");
-      if (fstat(fileno(fp), &fileinfo) < 0)
-        errx(errno, "[\x1B[31m!\x1B[0m] fstat() error");
-      if (!S_ISREG(fileinfo.st_mode)) {
-        fprintf(stderr,
-                "[\x1B[31m!\x1B[0m] %s is not a "
-                "regular file",
-                argv[3]);
-        exit(1);
-      }
-      if (argc > 4) {
-        sscanf(argv[4], "%d", &ret);
-        sendinterval = 500000 / (ret + 8);
-      }
-      printf("send %s to %s\n", argv[3], ip);
-      if ((sd = socket(AF_INET6, SOCK_DGRAM, 0)) < 0)
-        errx(errno, "[\x1B[31m!\x1B[0m] socket() error");
-      char *idx = strchr(ip, ']');
-      if (idx && strlen(idx) > 2) {
-        sscanf(idx + 2, "%d", &port);
-        *idx = 0;
-        ip++;
-      }
-      ret = inet_pton(AF_INET6, ip, &serveraddr.sin6_addr);
-      if (ret == 0) {
-        fprintf(stderr,
-                "[\x1B[31m!\x1B[0m] %s is not a valid "
-                "IPv6 address",
-                ip);
-        exit(1);
-      } else if (ret < 0)
-        errx(errno, "[\x1B[31m!\x1B[0m] inet_pton() error");
-      serveraddr.sin6_port = htons(port);
-      cnt = sprintf(buf, "\x02%s %ld %ld",
-                    (ftmp = strrchr(argv[3], '/')) ? ftmp + 1 : argv[3],
-                    fileinfo.st_size, fileinfo.st_blocks);
-      printf("[\x1B[32m+\x1B[0m] Sent WRQ, waiting for "
-             "respond...\n");
-      sendto(sd, buf, cnt, 0, (struct sockaddr *)&serveraddr,
-             sizeof(struct sockaddr_in6));
-      do
-        cnt =
-            recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&peeraddr, &len);
-      while (cnt <= 0 ||
-             memcmp(&serveraddr.sin6_addr, &peeraddr.sin6_addr,
-                    sizeof(struct in6_addr)) ||
-             serveraddr.sin6_port != peeraddr.sin6_port);
-      thr_arg[0] = &sd;
-      thr_arg[1] = &serveraddr;
-      setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-      if (cnt == 2 && buf[0] == 5) {
-        if (buf[1] == 2)
-          puts("[\x1B[33m-\x1B[0m] Server "
-               "rejected");
-        else
-          puts("[\x1B[31m!\x1B[0m] Server "
-               "reports error");
-      } else if (cnt == 2 && buf[0] == 4 && buf[1] == '0')
-        for (puts("[\x1B[32m+\x1B[0m] Server "
-                  "accepted\n\n"),
-             blkid = 1, pthread_create(&thr, NULL, thr_func, thr_arg),
-             gettimeofday(&tv1, NULL);
-             blkid <= fileinfo.st_blocks; blkid++) {
-          cnt = sprintf(buf, "\x03%d ", blkid);
-          ret = fread(buf + cnt, sizeof(char), 512, fp);
-          if (ferror(fp)) {
-            fprintf(stderr, "[\x1B[31m!\x1B[0m] "
-                            "Error in reading from "
-                            "file\n");
-            buf[0] = 5;
-            buf[1] = 3;
-            sendto(sd, buf, 2, 0, (struct sockaddr *)&serveraddr,
-                   sizeof(struct sockaddr_in6));
-            exit(1);
-          }
-          sendto(sd, buf, cnt + ret, 0, (struct sockaddr *)&serveraddr,
-                 sizeof(struct sockaddr_in6));
-        recv:
-          do
-            cnt = recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&peeraddr,
-                           &len);
-          while (cnt <= 0 && errno != EAGAIN ||
-                 memcmp(&serveraddr.sin6_addr, &peeraddr.sin6_addr,
-                        sizeof(struct in6_addr)) ||
-                 serveraddr.sin6_port != peeraddr.sin6_port);
-          buf[cnt] = 0;
-          if (buf[0] == 5) {
-            if (buf[1] == 8) {
-              paused = 1;
-              printf("\33[1A\33["
-                     "2KPAUSED\n");
-              setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv0,
-                         sizeof(struct timeval));
-            } else if (buf[1] == 9) {
-              paused = 0;
-              setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv,
-                         sizeof(struct timeval));
-              gettimeofday(&tv1, NULL);
-              ref = blkid;
-              speed_init = 1;
-            } else {
-              if (buf[1] == 0)
-                puts("[\x1B["
-                     "33m-\x1B["
-                     "0m] User "
-                     "cancalled"
-                     " "
-                     "transfe"
-                     "r");
-              else
-                puts("[\x1B["
-                     "31m!\x1B["
-                     "0m] "
-                     "Server "
-                     "reports "
-                     "error");
-              break;
-            }
-          }
-          if (buf[0] == 4)
-            sscanf(buf + 1, "%d", &acked);
-          if (acked != blkid || paused)
-            goto recv;
-          updatestatus(fileinfo.st_blocks, acked, ws.ws_col);
-          gettimeofday(&tv2, NULL);
-          if ((tv2.tv_sec - tv1.tv_sec) * 1000000 + tv2.tv_usec - tv1.tv_usec <
-              sendinterval * (blkid - ref)) {
-            nt.tv_nsec = (sendinterval * (blkid - ref) -
-                          ((tv2.tv_sec - tv1.tv_sec) * 1000000 + tv2.tv_usec -
-                           tv1.tv_usec)) *
-                         1000;
-            nanosleep(&nt, NULL);
-          }
-        }
-      else
-        puts("[\x1B[33m-\x1B[0m] Received invalid "
-             "response for WRQ "
-             "from server");
-      close(sd);
-      fclose(fp);
-    }
-  } else if (!strcasecmp(argv[1], "recv")) {
+
+  switch (strlen(filename)) {
+  case 0:;
     int size, ch, totalblk, rcvd_id;
     struct sockaddr_in6 clientaddr;
     char ipstr[40], filename[255], *directory = getcwd(NULL, 0);
     if (!directory)
       errx(errno, "[\x1B[31m!\x1B[0m] getcwd() error");
     printf("[\x1B[32m+\x1B[0m] Receive and save file to %s\n", directory);
-    if ((sd = socket(AF_INET6, SOCK_DGRAM, 0)) < 0)
-      errx(errno, "[\x1B[31m!\x1B[0m] socket() error");
-    serveraddr.sin6_port = htons(port);
-    if (bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0)
+    sa.sin6_port = htons(port);
+    if (bind(sd, (struct sockaddr *)&sa, sizeof(sa)) < 0)
       errx(errno, "[\x1B[31m!\x1B[0m] bind() error");
   next:
     puts("[\x1B[32m+\x1B[0m] Waiting for WRQ");
@@ -299,7 +189,7 @@ int main(int argc, char **argv) {
         puts("\n[\x1B[31m!\x1B[0m] Please input 'y' or "
              "'n'");
     printf("\n[\x1B[32m+\x1B[0m] Accepted %s\n\n\n", filename);
-    memcpy(&peeraddr, &clientaddr, sizeof(struct sockaddr_in6));
+    memcpy(&peer_sa, &clientaddr, sizeof(struct sockaddr_in6));
     if (!(fp = fopen(filename, "w"))) {
       buf[0] = 5;
       buf[1] = 3;
@@ -319,7 +209,7 @@ int main(int argc, char **argv) {
       cnt =
           recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&clientaddr, &len);
       if (cnt <= 0 ||
-          memcmp(&clientaddr, &peeraddr, sizeof(struct sockaddr_in6)))
+          memcmp(&clientaddr, &peer_sa, sizeof(struct sockaddr_in6)))
         continue;
       buf[cnt] = 0;
       if (buf[0] == 5) {
@@ -360,9 +250,141 @@ int main(int argc, char **argv) {
              "from client");
       updatestatus(totalblk, rcvd_id, ws.ws_col);
     }
-    close(sd);
-    fclose(fp);
-  } else
-    printf("Unknown command:%s\n", argv[1]);
+    break;
+  default:;
+    char *ip = argv[2], *ftmp;
+    int ret, acked, ref = 0;
+    struct stat fileinfo;
+    struct timeval tv = {.tv_sec = 1}, tv0 = {}, tv1, tv2;
+    struct timespec nt = {};
+    if (!(fp = fopen(argv[3], "r")))
+      err(errno, "%s", filename);
+    if (fstat(fileno(fp), &fileinfo) == -1)
+      err(errno, "%s", filename);
+    if (!S_ISREG(fileinfo.st_mode))
+      errx(EXIT_FAILURE, "%s is not a regular file", filename);
+    printf("send %s to %s\n", argv[3], ip);
+    char *idx = strchr(ip, ']');
+    if (idx && strlen(idx) > 2) {
+      sscanf(idx + 2, "%d", &port);
+      *idx = 0;
+      ip++;
+    }
+    ret = inet_pton(AF_INET6, ip, &sa.sin6_addr);
+    if (ret == 0) {
+      fprintf(stderr,
+              "[\x1B[31m!\x1B[0m] %s is not a valid "
+              "IPv6 address",
+              ip);
+      exit(1);
+    } else if (ret < 0)
+      errx(errno, "[\x1B[31m!\x1B[0m] inet_pton() error");
+    sa.sin6_port = htons(port);
+    cnt = sprintf(buf, "\x02%s %ld %ld",
+                  (ftmp = strrchr(argv[3], '/')) ? ftmp + 1 : argv[3],
+                  fileinfo.st_size, fileinfo.st_blocks);
+    printf("[\x1B[32m+\x1B[0m] Sent WRQ, waiting for "
+           "respond...\n");
+    sendto(sd, buf, cnt, 0, (struct sockaddr *)&sa,
+           sizeof(struct sockaddr_in6));
+    do
+      cnt = recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&peer_sa, &len);
+    while (cnt <= 0 ||
+           memcmp(&sa.sin6_addr, &peer_sa.sin6_addr, sizeof(struct in6_addr)) ||
+           sa.sin6_port != peer_sa.sin6_port);
+    thr_arg[0] = &sd;
+    thr_arg[1] = &sa;
+    setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (cnt == 2 && buf[0] == 5) {
+      if (buf[1] == 2)
+        puts("[\x1B[33m-\x1B[0m] Server "
+             "rejected");
+      else
+        puts("[\x1B[31m!\x1B[0m] Server "
+             "reports error");
+    } else if (cnt == 2 && buf[0] == 4 && buf[1] == '0')
+      for (puts("[\x1B[32m+\x1B[0m] Server "
+                "accepted\n\n"),
+           blkid = 1, pthread_create(&thr, NULL, thr_func, thr_arg),
+           gettimeofday(&tv1, NULL);
+           blkid <= fileinfo.st_blocks; blkid++) {
+        cnt = sprintf(buf, "\x03%d ", blkid);
+        ret = fread(buf + cnt, sizeof(char), 512, fp);
+        if (ferror(fp)) {
+          fprintf(stderr, "[\x1B[31m!\x1B[0m] "
+                          "Error in reading from "
+                          "file\n");
+          buf[0] = 5;
+          buf[1] = 3;
+          sendto(sd, buf, 2, 0, (struct sockaddr *)&sa,
+                 sizeof(struct sockaddr_in6));
+          exit(1);
+        }
+        sendto(sd, buf, cnt + ret, 0, (struct sockaddr *)&sa,
+               sizeof(struct sockaddr_in6));
+      recv:
+        do
+          cnt =
+              recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&peer_sa, &len);
+        while (cnt <= 0 && errno != EAGAIN ||
+               memcmp(&sa.sin6_addr, &peer_sa.sin6_addr,
+                      sizeof(struct in6_addr)) ||
+               sa.sin6_port != peer_sa.sin6_port);
+        buf[cnt] = 0;
+        if (buf[0] == 5) {
+          if (buf[1] == 8) {
+            paused = 1;
+            printf("\33[1A\33["
+                   "2KPAUSED\n");
+            setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv0,
+                       sizeof(struct timeval));
+          } else if (buf[1] == 9) {
+            paused = 0;
+            setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv,
+                       sizeof(struct timeval));
+            gettimeofday(&tv1, NULL);
+            ref = blkid;
+            speed_init = 1;
+          } else {
+            if (buf[1] == 0)
+              puts("[\x1B["
+                   "33m-\x1B["
+                   "0m] User "
+                   "cancalled"
+                   " "
+                   "transfe"
+                   "r");
+            else
+              puts("[\x1B["
+                   "31m!\x1B["
+                   "0m] "
+                   "Server "
+                   "reports "
+                   "error");
+            break;
+          }
+        }
+        if (buf[0] == 4)
+          sscanf(buf + 1, "%d", &acked);
+        if (acked != blkid || paused)
+          goto recv;
+        updatestatus(fileinfo.st_blocks, acked, ws.ws_col);
+        gettimeofday(&tv2, NULL);
+        if ((tv2.tv_sec - tv1.tv_sec) * 1000000 + tv2.tv_usec - tv1.tv_usec <
+            sendinterval * (blkid - ref)) {
+          nt.tv_nsec = (sendinterval * (blkid - ref) -
+                        ((tv2.tv_sec - tv1.tv_sec) * 1000000 + tv2.tv_usec -
+                         tv1.tv_usec)) *
+                       1000;
+          nanosleep(&nt, NULL);
+        }
+      }
+    else
+      puts("[\x1B[33m-\x1B[0m] Received invalid "
+           "response for WRQ "
+           "from server");
+  }
+  close(sd);
+  fclose(fp);
   return EXIT_SUCCESS;
 }
