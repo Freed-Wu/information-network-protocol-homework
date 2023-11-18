@@ -53,10 +53,9 @@ void updatestatus(int total, int current, int width) {
   for (size_t i = 0; i < barwidth; ++i)
     buf[i] = i < barwidth * current / total ? '#' : ' ';
 
-  printf("\33[2AProgress: "
-         "[%s]\n\33[2K%3d%%\t%6.2lf%cB\t%4dKBps\t%.1lfs\n",
-         buf, current * 100 / total, (double)current * 512 / pow(1024, lb),
-         unit[lb], speed, (double)(total - current) / 2 / speed);
+  printf("\33[2AProgress: [%s]\n\33[2K%3d%%\t%6.2lf%cB\t%4dKBps\t%.1lfs\n", buf,
+         current * 100 / total, (double)current * 512 / pow(1024, lb), unit[lb],
+         speed, (double)(total - current) / 2 / speed);
   free(buf);
 }
 
@@ -69,15 +68,13 @@ void *thr_func(void *arg) {
     if (ch == 'p') {
       buf[0] = 5;
       buf[1] = 8;
-      sendto(sd, buf, 2, 0, (struct sockaddr *)&peeraddr,
-             sizeof(struct sockaddr_in6));
+      sendto(sd, buf, 2, 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
       paused = 1;
       printf("\33[1A\33[2KPAUSED\n");
     } else if (ch == 'r') {
       buf[0] = 5;
       buf[1] = 9;
-      sendto(sd, buf, 2, 0, (struct sockaddr *)&peeraddr,
-             sizeof(struct sockaddr_in6));
+      sendto(sd, buf, 2, 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
       paused = 0;
       speed_init = 1;
     }
@@ -86,8 +83,7 @@ void *thr_func(void *arg) {
   puts("\n[\x1B[33m-\x1B[0m] Quitting");
   buf[0] = 5;
   buf[1] = 0;
-  sendto(sd, buf, 2, 0, (struct sockaddr *)&peeraddr,
-         sizeof(struct sockaddr_in6));
+  sendto(sd, buf, 2, 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
   exit(0);
 }
 
@@ -117,14 +113,13 @@ int main(int argc, char **argv) {
                             .sin6_port = htons(port),
                             .sin6_addr = in6addr_any},
                       peer_sa;
-  if (ip != NULL) {
+  if (ip != NULL)
     switch (inet_pton(AF_INET6, ip, &sa.sin6_addr)) {
     case -1:
       err(errno, NULL);
     case 0:
       errx(EXIT_FAILURE, "%s is not a valid IPv6 address", ip);
     }
-  }
   // parse speedlimit
   int sendinterval = 0;
   if (argc > 4) {
@@ -132,11 +127,13 @@ int main(int argc, char **argv) {
     sendinterval = 500000 / (sendinterval + 8);
   }
   // parse command
-  char *filename = "";
+  char filename[256] = "";
   if (strcasecmp(argv[1], "send") == 0) {
-    if (argc < 4)
+    if (argc < 4 || strlen(argv[3]) == 0)
       goto usage;
-    filename = argv[3];
+    // send will set filename in parse stage
+    // recv will set filename after `recvfrom()`
+    strcpy(filename, argv[3]);
   } else if (strcasecmp(argv[1], "recv") != 0)
     goto usage;
 
@@ -144,74 +141,74 @@ int main(int argc, char **argv) {
   if (sd == -1)
     err(errno, NULL);
 
-  int blkid, cnt, len = sizeof(struct sockaddr_in6);
-  char buf[BUFF_LEN];
-  FILE *fp;
   struct winsize ws;
+  ioctl(0, TIOCGWINSZ, &ws);
+  socklen_t len;
   pthread_t thr;
   void *thr_arg[2];
-  ioctl(0, TIOCGWINSZ, &ws);
+  FILE *fp;
+  int blkid, cnt;
+  char buf[BUFF_LEN];
+  int size, totalblk, rcvd_id;
 
   switch (strlen(filename)) {
-  case 0:;
-    int size, ch, totalblk, rcvd_id;
-    struct sockaddr_in6 clientaddr;
-    char ipstr[40], filename[255], *directory = getcwd(NULL, 0);
-    if (!directory)
-      errx(errno, "[\x1B[31m!\x1B[0m] getcwd() error");
-    printf("[\x1B[32m+\x1B[0m] Receive and save file to %s\n", directory);
-    sa.sin6_port = htons(port);
-    if (bind(sd, (struct sockaddr *)&sa, sizeof(sa)) < 0)
-      errx(errno, "[\x1B[31m!\x1B[0m] bind() error");
+    // server
+  case 0:
+    if (bind(sd, (struct sockaddr *)&sa, sizeof(sa)) == -1)
+      err(errno, NULL);
+    printf("[\x1B[32m+\x1B[0m] Receive and save file to %s\n", getcwd(NULL, 0));
+
+    // wait write request
   next:
     puts("[\x1B[32m+\x1B[0m] Waiting for WRQ");
     do
-      cnt =
-          recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&clientaddr, &len);
+      cnt = recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&peer_sa, &len);
+    // write request: 2 filename ' ' size ' ' block
     while (cnt < 4 || buf[0] != 2);
-    buf[cnt] = 0;
-    inet_ntop(AF_INET6, &clientaddr.sin6_addr, ipstr, sizeof(ipstr));
-    sscanf(buf + 1, "%s%d%d", filename, &size, &totalblk);
-    printf("[\x1B[32m+\x1B[0m] Received WRQ from %s port %d\n", ipstr,
-           ntohs(clientaddr.sin6_port));
-    printf("[\x1B[35m*\x1B[0m] Filename: %s Size: %d, accept? "
-           "(Y/n)",
-           filename, size);
-    while ((ch = getchar()) != EOF && ch != '\n' && ch != 'y' && ch != 'Y')
+    buf[cnt] = '\0';
+    char ipstr[40];
+    inet_ntop(AF_INET6, &peer_sa.sin6_addr, ipstr, sizeof(ipstr));
+    sscanf(buf + 1, "%s %d %d", filename, &size, &totalblk);
+    printf("[\x1B[32m+\x1B[0m] Received WRQ from %s port %d\n"
+           "[\x1B[35m*\x1B[0m] Filename: %s Size: %d, accept? (Y/n) ",
+           ipstr, ntohs(peer_sa.sin6_port), filename, size);
+
+    // handle write request
+    int ch;
+    while ((ch = getchar()) != EOF && ch != '\n' && ch != 'y' && ch != 'Y') {
       if (ch == 'n' || ch == 'N') {
+        // \n is due to (Y/n)
         printf("\n[\x1B[33m-\x1B[0m] Rejected %s\n", filename);
         buf[0] = 5;
         buf[1] = 2;
-        sendto(sd, buf, 2, 0, (struct sockaddr *)&clientaddr,
-               sizeof(struct sockaddr_in6));
+        sendto(sd, buf, 2, 0, (struct sockaddr *)&peer_sa, sizeof(peer_sa));
         goto next;
-      } else
-        puts("\n[\x1B[31m!\x1B[0m] Please input 'y' or "
-             "'n'");
-    printf("\n[\x1B[32m+\x1B[0m] Accepted %s\n\n\n", filename);
-    memcpy(&peer_sa, &clientaddr, sizeof(struct sockaddr_in6));
-    if (!(fp = fopen(filename, "w"))) {
+      }
+      // \n is due to (Y/n)
+      puts("\n[\x1B[31m!\x1B[0m] Please input 'y' or 'n'");
+    }
+    // \n is due to (Y/n)
+    printf("\n[\x1B[32m+\x1B[0m] Accepted %s\n", filename);
+    if ((fp = fopen(filename, "w")) == NULL) {
       buf[0] = 5;
       buf[1] = 3;
-      sendto(sd, buf, 2, 0, (struct sockaddr *)&clientaddr,
-             sizeof(struct sockaddr_in6));
-      errx(errno, "[\x1B[31m!\x1B[0m] fopen() error");
+      sendto(sd, buf, 2, 0, (struct sockaddr *)&peer_sa, sizeof(peer_sa));
+      err(errno, NULL);
     }
+
+    // acknowledgment: 4 '0'
     buf[0] = 4;
     buf[1] = '0';
-    sendto(sd, buf, 2, 0, (struct sockaddr *)&clientaddr,
-           sizeof(struct sockaddr_in6));
+    sendto(sd, buf, 2, 0, (struct sockaddr *)&peer_sa, sizeof(peer_sa));
     rcvd_id = 0;
     thr_arg[0] = &sd;
-    thr_arg[1] = &clientaddr;
+    thr_arg[1] = &peer_sa;
     pthread_create(&thr, NULL, thr_func, thr_arg);
     while (rcvd_id < totalblk) {
-      cnt =
-          recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&clientaddr, &len);
-      if (cnt <= 0 ||
-          memcmp(&clientaddr, &peer_sa, sizeof(struct sockaddr_in6)))
+      cnt = recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&peer_sa, &len);
+      if (cnt <= 0 || memcmp(&peer_sa, &peer_sa, sizeof(struct sockaddr_in6)))
         continue;
-      buf[cnt] = 0;
+      buf[cnt] = '\0';
       if (buf[0] == 5) {
         if (buf[1] == 8) {
           paused = 1;
@@ -221,36 +218,31 @@ int main(int argc, char **argv) {
           speed_init = 1;
         } else {
           if (buf[1] == 0)
-            puts("[\x1B[33m-\x1B[0m] User "
-                 "cancalled transfer");
+            puts("[\x1B[33m-\x1B[0m] User cancalled transfer");
           else
-            puts("[\x1B[31m!\x1B[0m] "
-                 "Client reports error");
+            puts("[\x1B[31m!\x1B[0m] Client reports error");
           break;
         }
       } else if (buf[0] == 3) {
         sscanf(buf + 1, "%d", &blkid);
         if (blkid == rcvd_id + 1) {
-          ++rcvd_id;
+          rcvd_id++;
           char *data = strchr(buf, ' ');
           if (!data++) {
-            puts("[\x1B[33m-\x1B[0m] "
-                 "Received invalid data "
-                 "from "
-                 "client");
+            puts("[\x1B[33m-\x1B[0m] Received invalid data from client");
             continue;
           }
           fwrite(data, sizeof(char), cnt - (data - buf), fp);
         }
         cnt = sprintf(buf, "\x04%d ", rcvd_id);
-        sendto(sd, buf, cnt, 0, (struct sockaddr *)&clientaddr,
-               sizeof(struct sockaddr_in6));
+        sendto(sd, buf, cnt, 0, (struct sockaddr *)&peer_sa, sizeof(peer_sa));
       } else
-        puts("[\x1B[33m-\x1B[0m] Received invalid data "
-             "from client");
+        puts("[\x1B[33m-\x1B[0m] Received invalid data from client");
       updatestatus(totalblk, rcvd_id, ws.ws_col);
     }
     break;
+
+    // client
   default:;
     char *ip = argv[2], *ftmp;
     int ret, acked, ref = 0;
@@ -272,10 +264,7 @@ int main(int argc, char **argv) {
     }
     ret = inet_pton(AF_INET6, ip, &sa.sin6_addr);
     if (ret == 0) {
-      fprintf(stderr,
-              "[\x1B[31m!\x1B[0m] %s is not a valid "
-              "IPv6 address",
-              ip);
+      fprintf(stderr, "[\x1B[31m!\x1B[0m] %s is not a valid IPv6 address", ip);
       exit(1);
     } else if (ret < 0)
       errx(errno, "[\x1B[31m!\x1B[0m] inet_pton() error");
@@ -283,10 +272,8 @@ int main(int argc, char **argv) {
     cnt = sprintf(buf, "\x02%s %ld %ld",
                   (ftmp = strrchr(argv[3], '/')) ? ftmp + 1 : argv[3],
                   fileinfo.st_size, fileinfo.st_blocks);
-    printf("[\x1B[32m+\x1B[0m] Sent WRQ, waiting for "
-           "respond...\n");
-    sendto(sd, buf, cnt, 0, (struct sockaddr *)&sa,
-           sizeof(struct sockaddr_in6));
+    printf("[\x1B[32m+\x1B[0m] Sent WRQ, waiting for respond...\n");
+    sendto(sd, buf, cnt, 0, (struct sockaddr *)&sa, sizeof(sa));
     do
       cnt = recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&peer_sa, &len);
     while (cnt <= 0 ||
@@ -297,31 +284,24 @@ int main(int argc, char **argv) {
     setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     if (cnt == 2 && buf[0] == 5) {
       if (buf[1] == 2)
-        puts("[\x1B[33m-\x1B[0m] Server "
-             "rejected");
+        puts("[\x1B[33m-\x1B[0m] Server rejected");
       else
-        puts("[\x1B[31m!\x1B[0m] Server "
-             "reports error");
+        puts("[\x1B[31m!\x1B[0m] Server reports error");
     } else if (cnt == 2 && buf[0] == 4 && buf[1] == '0')
-      for (puts("[\x1B[32m+\x1B[0m] Server "
-                "accepted\n\n"),
+      for (puts("[\x1B[32m+\x1B[0m] Server accepted\n"),
            blkid = 1, pthread_create(&thr, NULL, thr_func, thr_arg),
            gettimeofday(&tv1, NULL);
            blkid <= fileinfo.st_blocks; blkid++) {
         cnt = sprintf(buf, "\x03%d ", blkid);
         ret = fread(buf + cnt, sizeof(char), 512, fp);
         if (ferror(fp)) {
-          fprintf(stderr, "[\x1B[31m!\x1B[0m] "
-                          "Error in reading from "
-                          "file\n");
+          fprintf(stderr, "[\x1B[31m!\x1B[0m] Error in reading from file\n");
           buf[0] = 5;
           buf[1] = 3;
-          sendto(sd, buf, 2, 0, (struct sockaddr *)&sa,
-                 sizeof(struct sockaddr_in6));
+          sendto(sd, buf, 2, 0, (struct sockaddr *)&sa, sizeof(sa));
           exit(1);
         }
-        sendto(sd, buf, cnt + ret, 0, (struct sockaddr *)&sa,
-               sizeof(struct sockaddr_in6));
+        sendto(sd, buf, cnt + ret, 0, (struct sockaddr *)&sa, sizeof(sa));
       recv:
         do
           cnt =
@@ -330,12 +310,11 @@ int main(int argc, char **argv) {
                memcmp(&sa.sin6_addr, &peer_sa.sin6_addr,
                       sizeof(struct in6_addr)) ||
                sa.sin6_port != peer_sa.sin6_port);
-        buf[cnt] = 0;
+        buf[cnt] = '\0';
         if (buf[0] == 5) {
           if (buf[1] == 8) {
             paused = 1;
-            printf("\33[1A\33["
-                   "2KPAUSED\n");
+            printf("\33[1A\33[2KPAUSED\n");
             setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv0,
                        sizeof(struct timeval));
           } else if (buf[1] == 9) {
@@ -347,20 +326,9 @@ int main(int argc, char **argv) {
             speed_init = 1;
           } else {
             if (buf[1] == 0)
-              puts("[\x1B["
-                   "33m-\x1B["
-                   "0m] User "
-                   "cancalled"
-                   " "
-                   "transfe"
-                   "r");
+              puts("[\x1B[33m-\x1B[0m] User cancalled transfer");
             else
-              puts("[\x1B["
-                   "31m!\x1B["
-                   "0m] "
-                   "Server "
-                   "reports "
-                   "error");
+              puts("[\x1B[31m!\x1B[0m] Server reports error");
             break;
           }
         }
@@ -380,9 +348,7 @@ int main(int argc, char **argv) {
         }
       }
     else
-      puts("[\x1B[33m-\x1B[0m] Received invalid "
-           "response for WRQ "
-           "from server");
+      puts("[\x1B[33m-\x1B[0m] Received invalid response for WRQ from server");
   }
   close(sd);
   fclose(fp);
