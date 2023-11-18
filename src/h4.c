@@ -1,3 +1,6 @@
+#if 0
+bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -lm -o"$bin" && exec ./"$bin" "$@"
+#endif
 #include <arpa/inet.h>
 #include <errno.h>
 #include <math.h>
@@ -9,18 +12,15 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <termios.h>
 #include <unistd.h>
 
-#define DEFAULT_PORT 1000
+#define DEFAULT_PORT 20000
 #define BUFF_LEN 1024
 
 int paused = 0;
 int speed_init = 1;
-struct termios oldt;
 
 void pexit(char* s) {
-	tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
 	perror(s);
 	exit(errno);
 }
@@ -98,7 +98,6 @@ void* thr_func(void* arg) {
 	buf[1] = 0;
 	sendto(sd, buf, 2, 0, (struct sockaddr*)&peeraddr,
 	       sizeof(struct sockaddr_in6));
-	tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
 	exit(0);
 }
 
@@ -111,13 +110,9 @@ int main(int argc, char** argv) {
 	char buf[BUFF_LEN];
 	FILE* fp;
 	struct winsize ws;
-	struct termios newt;
 	pthread_t thr;
 	void* thr_arg[2];
 	ioctl(0, TIOCGWINSZ, &ws);
-	tcgetattr(STDIN_FILENO, &oldt);
-	newt = oldt;
-	newt.c_lflag &= ~(ICANON | ISIG);
 	if (argc < 2)
 		printf("Usage:\n%1$s send ip[:port] filename "
 		       "[speedlimit(KBps)]\n%1$s "
@@ -190,7 +185,6 @@ int main(int argc, char** argv) {
 			thr_arg[1] = &serveraddr;
 			setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv,
 				   sizeof(tv));
-			tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 			if (cnt == 2 && buf[0] == 5) {
 				if (buf[1] == 2)
 					puts("[\x1B[33m-\x1B[0m] Server "
@@ -312,7 +306,6 @@ int main(int argc, char** argv) {
 				puts("[\x1B[33m-\x1B[0m] Received invalid "
 				     "response for WRQ "
 				     "from server");
-			tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
 			close(sd);
 			fclose(fp);
 		}
@@ -331,7 +324,6 @@ int main(int argc, char** argv) {
 		if (bind(sd, (struct sockaddr*)&serveraddr, sizeof(serveraddr))
 		    < 0)
 			pexit("[\x1B[31m!\x1B[0m] bind() error");
-		tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 	next:
 		puts("[\x1B[32m+\x1B[0m] Waiting for WRQ");
 		do
@@ -431,7 +423,6 @@ int main(int argc, char** argv) {
 				     "from client");
 			updatestatus(totalblk, rcvd_id, ws.ws_col);
 		}
-		tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
 		close(sd);
 		fclose(fp);
 	}
