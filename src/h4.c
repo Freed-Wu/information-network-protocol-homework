@@ -2,8 +2,10 @@
 bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -lm -o"$bin" && exec ./"$bin" "$@"
 #endif
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <libgen.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -17,6 +19,7 @@ bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -lm -o"$bin" && exec ./"$
 
 #define DEFAULT_PORT 20000
 #define BUFF_LEN 1024
+#define PAUSE "\33[1A\33[2KPAUSED"
 
 int paused = 0;
 int speed_init = 1;
@@ -70,7 +73,7 @@ void *thr_func(void *arg) {
       buf[1] = 8;
       sendto(sd, buf, 2, 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
       paused = 1;
-      printf("\33[1A\33[2KPAUSED\n");
+      puts(PAUSE);
     } else if (ch == 'r') {
       buf[0] = 5;
       buf[1] = 9;
@@ -122,18 +125,14 @@ int main(int argc, char **argv) {
     }
   // parse speedlimit
   int sendinterval = 0;
-  if (argc > 4) {
-    sscanf(argv[4], "%d", &sendinterval);
-    sendinterval = 500000 / (sendinterval + 8);
-  }
+  if (argc > 4)
+    sendinterval = 500000 / (strtol(argv[4], NULL, 0) + 8);
   // parse command
-  char filename[256] = "";
+  char *filename = NULL;
   if (strcasecmp(argv[1], "send") == 0) {
-    if (argc < 4 || strlen(argv[3]) == 0)
+    filename = argv[3];
+    if (argc < 4 || strlen(filename) == 0)
       goto usage;
-    // send will set filename in parse stage
-    // recv will set filename after `recvfrom()`
-    strcpy(filename, argv[3]);
   } else if (strcasecmp(argv[1], "recv") != 0)
     goto usage;
 
@@ -141,25 +140,34 @@ int main(int argc, char **argv) {
   if (sd == -1)
     err(errno, NULL);
 
+  // updatestatus
   struct winsize ws;
   ioctl(0, TIOCGWINSZ, &ws);
+  // recv_from
+  char buf[BUFF_LEN] = "";
+  int cnt;
+  // peer_sa
   socklen_t len;
+  // pthread_create
   pthread_t thr;
-  void *thr_arg[2];
+  void *thr_arg[2] = {&sd, &sa};
+  // fopen
   FILE *fp;
-  int blkid, cnt;
-  char buf[BUFF_LEN];
-  int size, totalblk, rcvd_id;
+  // write request: 2 filename ' ' size ' ' block
+  int size, totalblk;
+  // acknowledgment: 4 blkid ' '
+  int blkid, rcvd_id;
+  // while (cont)
+  int cont = 1;
 
-  switch (strlen(filename)) {
+  if (filename == NULL) {
     // server
-  case 0:
     if (bind(sd, (struct sockaddr *)&sa, sizeof(sa)) == -1)
       err(errno, NULL);
     printf("[\x1B[32m+\x1B[0m] Receive and save file to %s\n", getcwd(NULL, 0));
 
     // wait write request
-  next:
+  wrq:
     puts("[\x1B[32m+\x1B[0m] Waiting for WRQ");
     do
       cnt = recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&peer_sa, &len);
@@ -168,62 +176,75 @@ int main(int argc, char **argv) {
     buf[cnt] = '\0';
     char ipstr[40];
     inet_ntop(AF_INET6, &peer_sa.sin6_addr, ipstr, sizeof(ipstr));
+    char _filename[256];
+    filename = _filename;
     sscanf(buf + 1, "%s %d %d", filename, &size, &totalblk);
-    printf("[\x1B[32m+\x1B[0m] Received WRQ from %s port %d\n"
+    printf("[\x1B[32m+\x1B[0m] Received WRQ from [%s]:%d\n"
            "[\x1B[35m*\x1B[0m] Filename: %s Size: %d, accept? (Y/n) ",
            ipstr, ntohs(peer_sa.sin6_port), filename, size);
+    if (connect(sd, (struct sockaddr *)&peer_sa, len) == -1)
+      err(errno, NULL);
 
     // handle write request
-    int ch;
-    while ((ch = getchar()) != EOF && ch != '\n' && ch != 'y' && ch != 'Y') {
-      if (ch == 'n' || ch == 'N') {
+    cont = 1;
+    while (cont) {
+      switch (tolower(getchar())) {
+      case 'n':
         // \n is due to (Y/n)
         printf("\n[\x1B[33m-\x1B[0m] Rejected %s\n", filename);
-        buf[0] = 5;
-        buf[1] = 2;
-        sendto(sd, buf, 2, 0, (struct sockaddr *)&peer_sa, sizeof(peer_sa));
-        goto next;
+        write(sd, "\x05\x02", 2);
+        goto wrq;
+      case 'y':
+      case '\n':
+      case EOF:
+        cont = 0;
+        break;
+      default:
+        // \n is due to (Y/n)
+        puts("\n[\x1B[31m!\x1B[0m] Please input 'y' or 'n'");
       }
-      // \n is due to (Y/n)
-      puts("\n[\x1B[31m!\x1B[0m] Please input 'y' or 'n'");
     }
     // \n is due to (Y/n)
     printf("\n[\x1B[32m+\x1B[0m] Accepted %s\n", filename);
     if ((fp = fopen(filename, "w")) == NULL) {
-      buf[0] = 5;
-      buf[1] = 3;
-      sendto(sd, buf, 2, 0, (struct sockaddr *)&peer_sa, sizeof(peer_sa));
+      write(sd, "\x05\x03", 2);
       err(errno, NULL);
     }
 
     // acknowledgment: 4 '0'
-    buf[0] = 4;
-    buf[1] = '0';
-    sendto(sd, buf, 2, 0, (struct sockaddr *)&peer_sa, sizeof(peer_sa));
+    write(sd,
+          "\x04"
+          "0",
+          2);
     rcvd_id = 0;
-    thr_arg[0] = &sd;
     thr_arg[1] = &peer_sa;
     pthread_create(&thr, NULL, thr_func, thr_arg);
-    while (rcvd_id < totalblk) {
-      cnt = recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&peer_sa, &len);
-      if (cnt <= 0 || memcmp(&peer_sa, &peer_sa, sizeof(struct sockaddr_in6)))
-        continue;
+    cont = 1;
+    while (rcvd_id < totalblk && cont) {
+      if ((cnt = read(sd, buf, BUFF_LEN)) == -1)
+        err(errno, NULL);
       buf[cnt] = '\0';
-      if (buf[0] == 5) {
-        if (buf[1] == 8) {
+      switch (buf[0]) {
+      case 5:
+        switch (buf[1]) {
+        case 8:
           paused = 1;
-          printf("\33[1A\33[2KPAUSED\n");
-        } else if (buf[1] == 9) {
+          puts(PAUSE);
+          break;
+        case 9:
           paused = 0;
           speed_init = 1;
-        } else {
+          break;
+        default:
           if (buf[1] == 0)
             puts("[\x1B[33m-\x1B[0m] User cancalled transfer");
           else
             puts("[\x1B[31m!\x1B[0m] Client reports error");
-          break;
+          cont = 0;
         }
-      } else if (buf[0] == 3) {
+        break;
+      case 3:
+        // data: 3 blkid ' ' data
         sscanf(buf + 1, "%d", &blkid);
         if (blkid == rcvd_id + 1) {
           rcvd_id++;
@@ -234,87 +255,78 @@ int main(int argc, char **argv) {
           }
           fwrite(data, sizeof(char), cnt - (data - buf), fp);
         }
-        cnt = sprintf(buf, "\x04%d ", rcvd_id);
-        sendto(sd, buf, cnt, 0, (struct sockaddr *)&peer_sa, sizeof(peer_sa));
-      } else
+        // acknowledgment: 4 blkid ' '
+        write(sd, buf, sprintf(buf, "\x04%d ", rcvd_id));
+        break;
+      default:
         puts("[\x1B[33m-\x1B[0m] Received invalid data from client");
+      }
       updatestatus(totalblk, rcvd_id, ws.ws_col);
     }
-    break;
 
+  } else {
     // client
-  default:;
-    char *ip = argv[2], *ftmp;
-    int ret, acked, ref = 0;
-    struct stat fileinfo;
-    struct timeval tv = {.tv_sec = 1}, tv0 = {}, tv1, tv2;
-    struct timespec nt = {};
-    if (!(fp = fopen(argv[3], "r")))
+    if (connect(sd, (struct sockaddr *)&sa, sizeof(sa)) == -1)
+      err(errno, NULL);
+
+    // send wait request
+    if ((fp = fopen(filename, "r")) == NULL)
       err(errno, "%s", filename);
+    struct stat fileinfo;
     if (fstat(fileno(fp), &fileinfo) == -1)
       err(errno, "%s", filename);
     if (!S_ISREG(fileinfo.st_mode))
       errx(EXIT_FAILURE, "%s is not a regular file", filename);
-    printf("send %s to %s\n", argv[3], ip);
-    char *idx = strchr(ip, ']');
-    if (idx && strlen(idx) > 2) {
-      sscanf(idx + 2, "%d", &port);
-      *idx = 0;
-      ip++;
-    }
-    ret = inet_pton(AF_INET6, ip, &sa.sin6_addr);
-    if (ret == 0) {
-      fprintf(stderr, "[\x1B[31m!\x1B[0m] %s is not a valid IPv6 address", ip);
-      exit(1);
-    } else if (ret < 0)
-      errx(errno, "[\x1B[31m!\x1B[0m] inet_pton() error");
-    sa.sin6_port = htons(port);
-    cnt = sprintf(buf, "\x02%s %ld %ld",
-                  (ftmp = strrchr(argv[3], '/')) ? ftmp + 1 : argv[3],
-                  fileinfo.st_size, fileinfo.st_blocks);
-    printf("[\x1B[32m+\x1B[0m] Sent WRQ, waiting for respond...\n");
-    sendto(sd, buf, cnt, 0, (struct sockaddr *)&sa, sizeof(sa));
-    do
-      cnt = recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&peer_sa, &len);
-    while (cnt <= 0 ||
-           memcmp(&sa.sin6_addr, &peer_sa.sin6_addr, sizeof(struct in6_addr)) ||
-           sa.sin6_port != peer_sa.sin6_port);
-    thr_arg[0] = &sd;
-    thr_arg[1] = &sa;
+    printf("send %s to [%s]:%d\n", filename, ip, port);
+    puts("[\x1B[32m+\x1B[0m] Sent WRQ, waiting for respond...");
+    write(sd, buf,
+          sprintf(buf, "\x02%s %ld %ld", basename(filename), fileinfo.st_size,
+                  fileinfo.st_blocks));
+
+    int ref = 0;
+    struct timeval tv = {.tv_sec = 1}, tv0 = {}, tv1, tv2;
+    struct timespec nt = {};
     setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    if (cnt == 2 && buf[0] == 5) {
+
+    // wait acknowledgment
+    do
+      cnt = read(sd, buf, BUFF_LEN);
+    while (cnt == -1);
+    if (cnt != 2)
+      goto invalid;
+    switch (buf[0]) {
+    case 5:
       if (buf[1] == 2)
         puts("[\x1B[33m-\x1B[0m] Server rejected");
       else
         puts("[\x1B[31m!\x1B[0m] Server reports error");
-    } else if (cnt == 2 && buf[0] == 4 && buf[1] == '0')
-      for (puts("[\x1B[32m+\x1B[0m] Server accepted\n"),
-           blkid = 1, pthread_create(&thr, NULL, thr_func, thr_arg),
-           gettimeofday(&tv1, NULL);
-           blkid <= fileinfo.st_blocks; blkid++) {
+      break;
+    case 4:
+      if (buf[1] != '0')
+        goto invalid;
+      puts("[\x1B[32m+\x1B[0m] Server accepted\n");
+      gettimeofday(&tv1, NULL);
+      pthread_create(&thr, NULL, thr_func, thr_arg);
+      for (blkid = 1; blkid <= fileinfo.st_blocks; blkid++) {
         cnt = sprintf(buf, "\x03%d ", blkid);
-        ret = fread(buf + cnt, sizeof(char), 512, fp);
-        if (ferror(fp)) {
+        int ret;
+        if ((ret = fread(buf + cnt, sizeof(char), 512, fp)) == -1) {
           fprintf(stderr, "[\x1B[31m!\x1B[0m] Error in reading from file\n");
           buf[0] = 5;
           buf[1] = 3;
-          sendto(sd, buf, 2, 0, (struct sockaddr *)&sa, sizeof(sa));
+          write(sd, buf, 2);
           exit(1);
         }
-        sendto(sd, buf, cnt + ret, 0, (struct sockaddr *)&sa, sizeof(sa));
+        write(sd, buf, cnt + ret);
       recv:
         do
-          cnt =
-              recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&peer_sa, &len);
-        while (cnt <= 0 && errno != EAGAIN ||
-               memcmp(&sa.sin6_addr, &peer_sa.sin6_addr,
-                      sizeof(struct in6_addr)) ||
-               sa.sin6_port != peer_sa.sin6_port);
+          cnt = write(sd, buf, BUFF_LEN);
+        while (cnt < 2);
         buf[cnt] = '\0';
         if (buf[0] == 5) {
           if (buf[1] == 8) {
             paused = 1;
-            printf("\33[1A\33[2KPAUSED\n");
+            puts(PAUSE);
             setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv0,
                        sizeof(struct timeval));
           } else if (buf[1] == 9) {
@@ -332,6 +344,7 @@ int main(int argc, char **argv) {
             break;
           }
         }
+        int acked;
         if (buf[0] == 4)
           sscanf(buf + 1, "%d", &acked);
         if (acked != blkid || paused)
@@ -347,8 +360,11 @@ int main(int argc, char **argv) {
           nanosleep(&nt, NULL);
         }
       }
-    else
+      break;
+    default:
+    invalid:
       puts("[\x1B[33m-\x1B[0m] Received invalid response for WRQ from server");
+    }
   }
   close(sd);
   fclose(fp);
