@@ -2,6 +2,7 @@
 bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -lm -o"$bin" && exec ./"$bin" "$@"
 #endif
 #include <arpa/inet.h>
+#include <err.h>
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
@@ -19,11 +20,6 @@ bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -lm -o"$bin" && exec ./"$
 
 int paused = 0;
 int speed_init = 1;
-
-void pexit(char *s) {
-  perror(s);
-  exit(errno);
-}
 
 void updatestatus(int total, int current, int width) {
   if (paused)
@@ -124,9 +120,9 @@ int main(int argc, char **argv) {
       struct timeval tv = {.tv_sec = 1}, tv0 = {}, tv1, tv2;
       struct timespec nt = {};
       if (!(fp = fopen(argv[3], "r")))
-        pexit("[\x1B[31m!\x1B[0m] fopen() error");
+        errx(errno, "[\x1B[31m!\x1B[0m] fopen() error");
       if (fstat(fileno(fp), &fileinfo) < 0)
-        pexit("[\x1B[31m!\x1B[0m] fstat() error");
+        errx(errno, "[\x1B[31m!\x1B[0m] fstat() error");
       if (!S_ISREG(fileinfo.st_mode)) {
         fprintf(stderr,
                 "[\x1B[31m!\x1B[0m] %s is not a "
@@ -140,7 +136,7 @@ int main(int argc, char **argv) {
       }
       printf("send %s to %s\n", argv[3], ip);
       if ((sd = socket(AF_INET6, SOCK_DGRAM, 0)) < 0)
-        pexit("[\x1B[31m!\x1B[0m] socket() error");
+        errx(errno, "[\x1B[31m!\x1B[0m] socket() error");
       char *idx = strchr(ip, ']');
       if (idx && strlen(idx) > 2) {
         sscanf(idx + 2, "%d", &port);
@@ -155,7 +151,7 @@ int main(int argc, char **argv) {
                 ip);
         exit(1);
       } else if (ret < 0)
-        pexit("[\x1B[31m!\x1B[0m] inet_pton() error");
+        errx(errno, "[\x1B[31m!\x1B[0m] inet_pton() error");
       serveraddr.sin6_port = htons(port);
       cnt = sprintf(buf, "\x02%s %ld %ld",
                     (ftmp = strrchr(argv[3], '/')) ? ftmp + 1 : argv[3],
@@ -270,13 +266,13 @@ int main(int argc, char **argv) {
     struct sockaddr_in6 clientaddr;
     char ipstr[40], filename[255], *directory = getcwd(NULL, 0);
     if (!directory)
-      pexit("[\x1B[31m!\x1B[0m] getcwd() error");
+      errx(errno, "[\x1B[31m!\x1B[0m] getcwd() error");
     printf("[\x1B[32m+\x1B[0m] Receive and save file to %s\n", directory);
     if ((sd = socket(AF_INET6, SOCK_DGRAM, 0)) < 0)
-      pexit("[\x1B[31m!\x1B[0m] socket() error");
+      errx(errno, "[\x1B[31m!\x1B[0m] socket() error");
     serveraddr.sin6_port = htons(port);
     if (bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0)
-      pexit("[\x1B[31m!\x1B[0m] bind() error");
+      errx(errno, "[\x1B[31m!\x1B[0m] bind() error");
   next:
     puts("[\x1B[32m+\x1B[0m] Waiting for WRQ");
     do
@@ -309,7 +305,7 @@ int main(int argc, char **argv) {
       buf[1] = 3;
       sendto(sd, buf, 2, 0, (struct sockaddr *)&clientaddr,
              sizeof(struct sockaddr_in6));
-      pexit("[\x1B[31m!\x1B[0m] fopen() error");
+      errx(errno, "[\x1B[31m!\x1B[0m] fopen() error");
     }
     buf[0] = 4;
     buf[1] = '0';
@@ -368,5 +364,5 @@ int main(int argc, char **argv) {
     fclose(fp);
   } else
     printf("Unknown command:%s\n", argv[1]);
-  return 0;
+  return EXIT_SUCCESS;
 }
