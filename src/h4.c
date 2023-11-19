@@ -1,12 +1,11 @@
 #if 0
-bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -lm -o"$bin" && exec ./"$bin" "$@"
+bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -o"$bin" && exec ./"$bin" "$@"
 #endif
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
 #include <libgen.h>
-#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,51 +20,69 @@ bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -lm -o"$bin" && exec ./"$
 #define DEFAULT_PORT 20000
 #define BUFF_LEN 1024
 #define PAUSE "\33[1A\33[2KPAUSED"
-#define PROGRESS "\33[2AProgress: [%s]\n\33[2K"
 #define LOG_VERBOSE "[\x1B[35m*\x1B[0m] "
 #define LOG_INFO "[\x1B[32m+\x1B[0m] "
 #define LOG_WARN "[\x1B[33m-\x1B[0m] "
 #define LOG_ERROR "[\x1B[31m!\x1B[0m] "
 
 int paused = 0;
-int speed_init = 1;
+int speed_status = 1;
 
-void updatestatus(int total, int current, int width) {
+static inline __suseconds_t tvdiff(struct timeval new_tv,
+                                   struct timeval old_tv) {
+  return (new_tv.tv_sec - old_tv.tv_sec) * 1000000 + new_tv.tv_usec -
+         old_tv.tv_usec;
+}
+
+void updatestatus(size_t total, size_t current, int width) {
   if (paused)
     return;
-  int barwidth = width - 12;
-  char *buf = malloc(barwidth + 1);
-  int lb = log10(current * 512) / log10(1024);
-  static int speed = 0;
-  static struct timeval t1;
-  struct timeval t2;
-  const char unit[] = " KMGTP";
 
-  if (!((current - 1) % 50)) {
-    if (speed_init == 1) {
-      gettimeofday(&t1, NULL);
-      speed_init = 2;
-    } else if (speed_init == 2) {
-      gettimeofday(&t2, NULL);
-      speed = 25000000 /
-              ((t2.tv_sec - t1.tv_sec) * 1000000 + t2.tv_usec - t1.tv_usec);
-      memcpy(&t1, &t2, sizeof(struct timeval));
-      speed_init = 0;
-    } else {
-      gettimeofday(&t2, NULL);
+  static int speed = 0;
+  static struct timeval last_tv;
+  struct timeval tv;
+  if (current % 50 == 1) {
+    switch (speed_status) {
+    case 1:
+      gettimeofday(&last_tv, NULL);
+      speed_status = 2;
+      break;
+    case 2:
+      gettimeofday(&tv, NULL);
+      speed = 25000000 / tvdiff(tv, last_tv);
+      memcpy(&last_tv, &tv, sizeof(struct timeval));
+      speed_status = 3;
+      break;
+    case 3:
+      gettimeofday(&tv, NULL);
       speed *= 0.9;
-      speed += 2500000 /
-               ((t2.tv_sec - t1.tv_sec) * 1000000 + t2.tv_usec - t1.tv_usec);
-      memcpy(&t1, &t2, sizeof(struct timeval));
+      speed += 25000000 / tvdiff(tv, last_tv);
+      memcpy(&last_tv, &tv, sizeof(struct timeval));
     }
   }
 
-  for (size_t i = 0; i < barwidth; ++i)
-    buf[i] = i < barwidth * current / total ? '#' : ' ';
+  width -= sizeof("Progress: []") - sizeof("");
+  char *buf = malloc(width + sizeof(""));
+  if (buf == NULL)
+    err(errno, NULL);
+  int len = width * current / total;
+  memset(buf, '#', len);
+  memset(buf + len, ' ', width - len);
 
-  printf(PROGRESS "%3d%%\t%6.2lf%cB\t%4dKBps\t%.1lfs\n", buf,
-         current * 100 / total, (double)current * 512 / pow(1024, lb), unit[lb],
-         speed, (double)(total - current) / 2 / speed);
+  size_t current_size = current << 9;
+  size_t unit_size = 1;
+  const char units[] = " KMGTP";
+  const char *p_unit = units;
+  while (*(p_unit + 1) != '\0' && current_size >= unit_size << 10) {
+    p_unit++;
+    unit_size <<= 10;
+  }
+
+  // Progress: [##  ]
+  // precentage% current_size current_unit speed KB/s lfs s
+  printf("\33[2AProgress: [%s]\n\33[2K%3zd%%\t%6.2lf%cB\t%4dKB/s\t%.1lfs\n",
+         buf, current * 100 / total, (double)current_size / unit_size, *p_unit,
+         speed, (total - current) / 2.0 / speed);
   free(buf);
 }
 
@@ -81,15 +98,14 @@ void *thr_func(void *arg) {
       break;
     case 'r':
       paused = 0;
-      speed_init = 1;
+      speed_status = 1;
       write(sd, "\x05\x09", 2);
-      break;
     }
   }
   paused = 1;
   puts("\n" LOG_WARN "Quitting");
   write(sd, "\x05\0", 2);
-  struct termios oldattr = *(struct termios *)((void **)arg)[2];
+  struct termios oldattr = *(struct termios *)((void **)arg)[1];
   tcsetattr(STDIN_FILENO, TCSANOW, &oldattr);
   exit(0);
 }
@@ -113,7 +129,7 @@ int main(int argc, char **argv) {
   usage:
     errx(EXIT_FAILURE,
          "Usage: \n"
-         "  %1$s send ip[:port] filename [speedlimit(KBps)]\n"
+         "  %1$s send ip[:port] filename [speedlimit(KB/s)]\n"
          "  %1$s recv [ip][:port]",
          argv[0]);
   // parse ip and port
@@ -170,13 +186,13 @@ int main(int argc, char **argv) {
   socklen_t len;
   // pthread_create
   pthread_t thr;
-  void *thr_arg[3] = {&sd, &sa};
+  void *thr_arg[2] = {&sd};
   // fopen
   FILE *fp;
   // write request: 2 filename ' ' size ' ' block
-  int size, totalblk;
+  size_t size, totalblk;
   // acknowledgment: 4 blkid ' '
-  int blkid, rcvd_id;
+  size_t blkid, rcvd_id;
   // while (cont)
   int cont = 1;
   struct termios oldattr;
@@ -199,14 +215,14 @@ int main(int argc, char **argv) {
     inet_ntop(AF_INET6, &peer_sa.sin6_addr, ipstr, sizeof(ipstr));
     char _filename[256];
     filename = _filename;
-    sscanf(buf + 1, "%s %d %d", filename, &size, &totalblk);
+    sscanf(buf + 1, "%s %zd %zd", filename, &size, &totalblk);
     printf(LOG_INFO "Received WRQ from [%s]:%d\n" LOG_VERBOSE
-                    "Filename: %s Size: %d, accept? (Y/n) ",
+                    "Filename: %s Size: %zd, accept? (Y/n) ",
            ipstr, ntohs(peer_sa.sin6_port), filename, size);
     if (connect(sd, (struct sockaddr *)&peer_sa, len) == -1)
       err(errno, NULL);
     oldattr = set_term();
-    thr_arg[2] = &oldattr;
+    thr_arg[1] = &oldattr;
 
     // handle write request
     cont = 1;
@@ -241,7 +257,6 @@ int main(int argc, char **argv) {
           "0",
           2);
     rcvd_id = 0;
-    thr_arg[1] = &peer_sa;
     pthread_create(&thr, NULL, thr_func, thr_arg);
     cont = 1;
     while (rcvd_id < totalblk && cont) {
@@ -257,7 +272,7 @@ int main(int argc, char **argv) {
           break;
         case 9:
           paused = 0;
-          speed_init = 1;
+          speed_status = 1;
           break;
         default:
           if (buf[1] == 0)
@@ -269,7 +284,7 @@ int main(int argc, char **argv) {
         break;
       case 3:
         // data: 3 blkid ' ' data
-        sscanf(buf + 1, "%d", &blkid);
+        sscanf(buf + 1, "%zd", &blkid);
         if (blkid == rcvd_id + 1) {
           rcvd_id++;
           char *data = strchr(buf, ' ');
@@ -280,7 +295,7 @@ int main(int argc, char **argv) {
           fwrite(data, sizeof(char), cnt - (data - buf), fp);
         }
         // acknowledgment: 4 blkid ' '
-        write(sd, buf, sprintf(buf, "\x04%d ", rcvd_id));
+        write(sd, buf, sprintf(buf, "\x04%zd ", rcvd_id));
         break;
       default:
         puts(LOG_WARN "Received invalid data from client");
@@ -293,7 +308,7 @@ int main(int argc, char **argv) {
     if (connect(sd, (struct sockaddr *)&sa, sizeof(sa)) == -1)
       err(errno, NULL);
     oldattr = set_term();
-    thr_arg[2] = &oldattr;
+    thr_arg[1] = &oldattr;
 
     // send wait request
     if ((fp = fopen(filename, "r")) == NULL)
@@ -308,10 +323,6 @@ int main(int argc, char **argv) {
     write(sd, buf,
           sprintf(buf, "\x02%s %ld %ld", basename(filename), fileinfo.st_size,
                   fileinfo.st_blocks));
-
-    struct timeval tv = {.tv_sec = 1}, tv0 = {}, tv1, tv2;
-    struct timespec nt = {};
-    setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     // wait acknowledgment
     do
@@ -329,59 +340,67 @@ int main(int argc, char **argv) {
     case 4:
       if (buf[1] != '0')
         goto invalid;
+      // double "\n"s is due to progress bar
       puts(LOG_INFO "Server accepted\n");
       pthread_create(&thr, NULL, thr_func, thr_arg);
-      gettimeofday(&tv1, NULL);
-      // data: 3 blkid ' ' data
-      for (blkid = 1; blkid <= fileinfo.st_blocks; blkid++) {
-        cnt = sprintf(buf, "\x03%d ", blkid);
+
+      struct timeval tv = {.tv_sec = 1}, tv0 = {}, last_tv, tv2;
+      setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      gettimeofday(&last_tv, NULL);
+      for (blkid = 1; blkid <= fileinfo.st_blocks && cont; blkid++) {
+        // send data
+        // data: 3 blkid ' ' data
+        cnt = sprintf(buf, "\x03%zd ", blkid);
         int ret;
         if ((ret = fread(buf + cnt, sizeof(char), 512, fp)) == -1) {
-          fprintf(stderr, LOG_ERROR "Error in reading from file\n");
           write(sd, "\x05\x03", 2);
-          exit(1);
+          err(errno, "%s", filename);
         }
         write(sd, buf, cnt + ret);
-      recv:
-        do
-          cnt = write(sd, buf, BUFF_LEN);
-        while (cnt < 2);
-        buf[cnt] = '\0';
-        int ref;
-        if (buf[0] == 5) {
-          if (buf[1] == 8) {
-            paused = 1;
-            puts(PAUSE);
-            setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv0,
-                       sizeof(struct timeval));
-          } else if (buf[1] == 9) {
-            paused = 0;
-            setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv,
-                       sizeof(struct timeval));
-            gettimeofday(&tv1, NULL);
-            ref = blkid;
-            speed_init = 1;
-          } else {
-            if (buf[1] == 0)
+        // handle response
+        int ref, acked = -1;
+        do {
+          do
+            cnt = read(sd, buf, BUFF_LEN);
+          while (cnt < 2);
+          buf[cnt] = '\0';
+          switch (buf[0]) {
+          case 5:
+            switch (buf[1]) {
+            case 8:
+              paused = 1;
+              puts(PAUSE);
+              setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
+              break;
+            case 9:
+              paused = 0;
+              setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+              gettimeofday(&last_tv, NULL);
+              ref = blkid;
+              speed_status = 1;
+              break;
+            case 0:
               puts(LOG_WARN "User cancalled transfer");
-            else
+              goto exit;
+            default:
               puts(LOG_ERROR "Server reports error");
+              goto invalid;
+            }
             break;
+          case 4:
+            sscanf(buf + 1, "%d", &acked);
+            break;
+          default:
+            puts(LOG_ERROR "Server reports error");
+            goto invalid;
           }
-        }
-        int acked;
-        if (buf[0] == 4)
-          sscanf(buf + 1, "%d", &acked);
-        if (acked != blkid || paused)
-          goto recv;
+        } while (acked != blkid || paused);
         updatestatus(fileinfo.st_blocks, acked, ws.ws_col);
         gettimeofday(&tv2, NULL);
-        if ((tv2.tv_sec - tv1.tv_sec) * 1000000 + tv2.tv_usec - tv1.tv_usec <
-            sendinterval * (blkid - ref)) {
-          nt.tv_nsec = (sendinterval * (blkid - ref) -
-                        ((tv2.tv_sec - tv1.tv_sec) * 1000000 + tv2.tv_usec -
-                         tv1.tv_usec)) *
-                       1000;
+        __suseconds_t usec = tvdiff(tv2, last_tv);
+        if (usec < sendinterval * (blkid - ref)) {
+          struct timespec nt = {
+              .tv_nsec = (sendinterval * (blkid - ref) - usec) * 1000};
           nanosleep(&nt, NULL);
         }
       }
@@ -391,6 +410,8 @@ int main(int argc, char **argv) {
       puts(LOG_WARN "Received invalid response for WRQ from server");
     }
   }
+exit:
+  pthread_cancel(thr);
   tcsetattr(STDIN_FILENO, TCSANOW, &oldattr);
   close(sd);
   fclose(fp);
