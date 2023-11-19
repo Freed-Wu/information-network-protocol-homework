@@ -25,7 +25,9 @@ bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -o"$bin" && exec ./"$bin"
 #define LOG_INFO "[\x1B[32m+\x1B[0m] "
 #define LOG_WARN "[\x1B[33m-\x1B[0m] "
 #define LOG_ERROR "[\x1B[31m!\x1B[0m] "
-#define PACKAGES_INTERVAL 50
+#define PACKAGE_INTERVAL 50ul
+#define PACKAGE_SIZE 512
+#define KB 1024
 
 bool paused = false;
 bool speed_is_initialized = false;
@@ -43,14 +45,15 @@ void updatestatus(size_t total, size_t current, int width) {
   static int speed = 0;
   static struct timeval last_tv;
   struct timeval tv;
-  if (current % PACKAGES_INTERVAL == 1) {
+  if (current % PACKAGE_INTERVAL == 1) {
     // exponential smooth
     // speed'_n = 0.9 speed'_{n - 1} + speed_n
     // speed'_n = \sum_{k = 1}^n{0.9^{n - k} speed_k}
     speed *= 0.9;
     gettimeofday(&tv, NULL);
     if (speed_is_initialized)
-      speed += PACKAGES_INTERVAL * 1000 * 1000 / tvdiff(tv, last_tv);
+      speed += PACKAGE_INTERVAL * 1000 * 1000 * PACKAGE_SIZE / KB /
+               tvdiff(tv, last_tv);
     else
       speed_is_initialized = true;
     last_tv = tv;
@@ -64,20 +67,20 @@ void updatestatus(size_t total, size_t current, int width) {
   memset(buf, '#', len);
   memset(buf + len, ' ', width - len);
 
-  size_t current_size = current << 9;
+  size_t current_size = current * PACKAGE_SIZE;
   size_t unit_size = 1;
   const char units[] = " KMGTP";
   const char *p_unit = units;
-  while (*(p_unit + 1) != '\0' && current_size >= unit_size << 10) {
+  while (*(p_unit + 1) != '\0' && current_size >= unit_size * KB) {
     p_unit++;
-    unit_size <<= 10;
+    unit_size *= KB;
   }
 
   // Progress: [##  ]
   // precentage% current_size current_unit speed KB/s lfs s
   printf("\33[2AProgress: [%s]\n\33[2K%3zd%%\t%6.2lf%cB\t%4dKB/s\t%.1lfs\n",
          buf, current * 100 / total, (double)current_size / unit_size, *p_unit,
-         speed, (double)(total - current) / speed);
+         speed, (double)(total - current) * PACKAGE_SIZE / KB / speed);
   free(buf);
 }
 
@@ -124,7 +127,7 @@ int main(int argc, char **argv) {
   usage:
     errx(EXIT_FAILURE,
          "Usage: \n"
-         "  %1$s send ip[:port] filename [speedlimit(KB/s)]\n"
+         "  %1$s send ip[:port] filename [speed_limit(KB/s)]\n"
          "  %1$s recv [ip][:port]",
          argv[0]);
   // parse ip and port
@@ -154,10 +157,15 @@ int main(int argc, char **argv) {
     case 0:
       errx(EXIT_FAILURE, "%s is not a valid IPv6 address", ip);
     }
-  // parse speedlimit
-  int sendinterval = 0;
-  if (argc > 4)
-    sendinterval = 500000 / (strtol(argv[4], NULL, 0) + 8);
+  // parse speed limit
+  int send_interval = 0;
+  if (argc > 4) {
+    send_interval = strtol(argv[4], NULL, 0);
+    if (send_interval <= 0)
+      err(EXIT_FAILURE, "%s is not a legal speed limit", argv[4]);
+    // unit is microsecond
+    send_interval = 1000 * 1000 * PACKAGE_SIZE / KB / send_interval;
+  }
   // parse command
   char *filename = NULL;
   if (strcasecmp(argv[1], "send") == 0) {
@@ -339,8 +347,8 @@ int main(int argc, char **argv) {
       puts(LOG_INFO "Server accepted\n");
       pthread_create(&thr, NULL, thr_func, thr_arg);
 
-      struct timeval tv = {.tv_sec = 1}, tv0 = {}, last_tv, tv2;
-      setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      struct timeval tv_normal = {.tv_sec = 1}, tv_paused = {}, last_tv, tv;
+      setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv_normal, sizeof(tv_normal));
       gettimeofday(&last_tv, NULL);
       for (blkid = 1; blkid <= fileinfo.st_blocks && cont; blkid++) {
         // send data
@@ -353,7 +361,7 @@ int main(int argc, char **argv) {
         }
         write(sd, buf, cnt + ret);
         // handle response
-        int ref, acked = -1;
+        int acked = -1;
         do {
           do
             cnt = read(sd, buf, BUFF_LEN);
@@ -365,14 +373,15 @@ int main(int argc, char **argv) {
             case 8:
               paused = true;
               puts(PAUSE);
-              setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
+              setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv_paused,
+                         sizeof(tv_paused));
               break;
             case 9:
               paused = false;
-              setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-              gettimeofday(&last_tv, NULL);
-              ref = blkid;
               speed_is_initialized = false;
+              setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv_normal,
+                         sizeof(tv_normal));
+              gettimeofday(&last_tv, NULL);
               break;
             case 0:
               puts(LOG_WARN "User cancalled transfer");
@@ -390,12 +399,12 @@ int main(int argc, char **argv) {
             goto invalid;
           }
         } while (acked != blkid || paused);
-        updatestatus(fileinfo.st_blocks, acked, ws.ws_col);
-        gettimeofday(&tv2, NULL);
-        __suseconds_t usec = tvdiff(tv2, last_tv);
-        if (usec < sendinterval * (blkid - ref)) {
-          struct timespec nt = {
-              .tv_nsec = (sendinterval * (blkid - ref) - usec) * 1000};
+        updatestatus(fileinfo.st_blocks, blkid, ws.ws_col);
+        gettimeofday(&tv, NULL);
+        __suseconds_t usec = tvdiff(tv, last_tv);
+        last_tv = tv;
+        if (usec < send_interval) {
+          struct timespec nt = {.tv_nsec = (send_interval - usec) * 1000};
           nanosleep(&nt, NULL);
         }
       }
