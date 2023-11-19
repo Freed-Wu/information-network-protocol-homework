@@ -25,9 +25,10 @@ bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -o"$bin" && exec ./"$bin"
 #define LOG_INFO "[\x1B[32m+\x1B[0m] "
 #define LOG_WARN "[\x1B[33m-\x1B[0m] "
 #define LOG_ERROR "[\x1B[31m!\x1B[0m] "
+#define PACKAGES_INTERVAL 50
 
 bool paused = false;
-int speed_status = 1;
+bool speed_is_initialized = false;
 
 static inline __suseconds_t tvdiff(struct timeval new_tv,
                                    struct timeval old_tv) {
@@ -42,24 +43,17 @@ void updatestatus(size_t total, size_t current, int width) {
   static int speed = 0;
   static struct timeval last_tv;
   struct timeval tv;
-  if (current % 50 == 1) {
-    switch (speed_status) {
-    case 1:
-      gettimeofday(&last_tv, NULL);
-      speed_status = 2;
-      break;
-    case 2:
-      gettimeofday(&tv, NULL);
-      speed = 25000000 / tvdiff(tv, last_tv);
-      memcpy(&last_tv, &tv, sizeof(struct timeval));
-      speed_status = 3;
-      break;
-    case 3:
-      gettimeofday(&tv, NULL);
-      speed *= 0.9;
-      speed += 25000000 / tvdiff(tv, last_tv);
-      memcpy(&last_tv, &tv, sizeof(struct timeval));
-    }
+  if (current % PACKAGES_INTERVAL == 1) {
+    // exponential smooth
+    // speed'_n = 0.9 speed'_{n - 1} + speed_n
+    // speed'_n = \sum_{k = 1}^n{0.9^{n - k} speed_k}
+    speed *= 0.9;
+    gettimeofday(&tv, NULL);
+    if (speed_is_initialized)
+      speed += PACKAGES_INTERVAL * 1000 * 1000 / tvdiff(tv, last_tv);
+    else
+      speed_is_initialized = true;
+    last_tv = tv;
   }
 
   width -= sizeof("Progress: []") - sizeof("");
@@ -83,7 +77,7 @@ void updatestatus(size_t total, size_t current, int width) {
   // precentage% current_size current_unit speed KB/s lfs s
   printf("\33[2AProgress: [%s]\n\33[2K%3zd%%\t%6.2lf%cB\t%4dKB/s\t%.1lfs\n",
          buf, current * 100 / total, (double)current_size / unit_size, *p_unit,
-         speed, (total - current) / 2.0 / speed);
+         speed, (double)(total - current) / speed);
   free(buf);
 }
 
@@ -99,7 +93,7 @@ void *thr_func(void *arg) {
       break;
     case 'r':
       paused = false;
-      speed_status = 1;
+      speed_is_initialized = false;
       write(sd, "\x05\x09", 2);
     }
   }
@@ -273,7 +267,7 @@ int main(int argc, char **argv) {
           break;
         case 9:
           paused = false;
-          speed_status = 1;
+          speed_is_initialized = false;
           break;
         default:
           if (buf[1] == 0)
@@ -378,7 +372,7 @@ int main(int argc, char **argv) {
               setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
               gettimeofday(&last_tv, NULL);
               ref = blkid;
-              speed_status = 1;
+              speed_is_initialized = false;
               break;
             case 0:
               puts(LOG_WARN "User cancalled transfer");
