@@ -15,11 +15,13 @@ bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -lm -o"$bin" && exec ./"$
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <termios.h>
 #include <unistd.h>
 
 #define DEFAULT_PORT 20000
 #define BUFF_LEN 1024
 #define PAUSE "\33[1A\33[2KPAUSED"
+#define PROGRESS "\33[2AProgress: [%s]\n\33[2K"
 #define LOG_VERBOSE "[\x1B[35m*\x1B[0m] "
 #define LOG_INFO "[\x1B[32m+\x1B[0m] "
 #define LOG_WARN "[\x1B[33m-\x1B[0m] "
@@ -61,33 +63,49 @@ void updatestatus(int total, int current, int width) {
   for (size_t i = 0; i < barwidth; ++i)
     buf[i] = i < barwidth * current / total ? '#' : ' ';
 
-  printf("\33[2AProgress: [%s]\n\33[2K%3d%%\t%6.2lf%cB\t%4dKBps\t%.1lfs\n", buf,
+  printf(PROGRESS "%3d%%\t%6.2lf%cB\t%4dKBps\t%.1lfs\n", buf,
          current * 100 / total, (double)current * 512 / pow(1024, lb), unit[lb],
          speed, (double)(total - current) / 2 / speed);
   free(buf);
 }
 
 void *thr_func(void *arg) {
-  struct sockaddr_in6 peeraddr = *(struct sockaddr_in6 *)((void **)arg)[1];
-  int ch, sd = *(int *)((void **)arg)[0];
-  ch = getchar();
-  while (ch != 'q') {
-    if (ch == 'p') {
-      sendto(sd, "\x05\x08", 2, 0, (struct sockaddr *)&peeraddr,
-             sizeof(peeraddr));
+  int sd = *(int *)((void **)arg)[0];
+  int ch;
+  while ((ch = tolower(getchar())) != 'q') {
+    switch (ch) {
+    case 'p':
       paused = 1;
       puts(PAUSE);
-    } else if (ch == 'r') {
-      sendto(sd, "\x05\x09", 2, 0, (struct sockaddr *)&peeraddr,
-             sizeof(peeraddr));
+      write(sd, "\x05\x08", 2);
+      break;
+    case 'r':
       paused = 0;
       speed_init = 1;
+      write(sd, "\x05\x09", 2);
+      break;
     }
   }
   paused = 1;
   puts("\n" LOG_WARN "Quitting");
-  sendto(sd, "\x05\0", 2, 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
+  write(sd, "\x05\0", 2);
+  struct termios oldattr = *(struct termios *)((void **)arg)[2];
+  tcsetattr(STDIN_FILENO, TCSANOW, &oldattr);
   exit(0);
+}
+
+/**
+ * disable line buffer (canonical mode), enable echo
+ * must be called after connect() to avoid wrong address family
+ */
+struct termios set_term() {
+  struct termios oldattr, newattr;
+  tcgetattr(STDIN_FILENO, &oldattr);
+  newattr = oldattr;
+  newattr.c_lflag &= ~ICANON;
+  newattr.c_lflag |= ECHO;
+  tcsetattr(STDIN_FILENO, TCSANOW, &newattr);
+  return oldattr;
 }
 
 int main(int argc, char **argv) {
@@ -152,7 +170,7 @@ int main(int argc, char **argv) {
   socklen_t len;
   // pthread_create
   pthread_t thr;
-  void *thr_arg[2] = {&sd, &sa};
+  void *thr_arg[3] = {&sd, &sa};
   // fopen
   FILE *fp;
   // write request: 2 filename ' ' size ' ' block
@@ -161,6 +179,7 @@ int main(int argc, char **argv) {
   int blkid, rcvd_id;
   // while (cont)
   int cont = 1;
+  struct termios oldattr;
 
   if (filename == NULL) {
     // server
@@ -186,6 +205,8 @@ int main(int argc, char **argv) {
            ipstr, ntohs(peer_sa.sin6_port), filename, size);
     if (connect(sd, (struct sockaddr *)&peer_sa, len) == -1)
       err(errno, NULL);
+    oldattr = set_term();
+    thr_arg[2] = &oldattr;
 
     // handle write request
     cont = 1;
@@ -207,7 +228,8 @@ int main(int argc, char **argv) {
       }
     }
     // \n is due to (Y/n)
-    printf("\n" LOG_INFO "Accepted %s\n", filename);
+    // double "\n"s is due to progress bar
+    printf("\n" LOG_INFO "Accepted %s\n\n", filename);
     if ((fp = fopen(filename, "w")) == NULL) {
       write(sd, "\x05\x03", 2);
       err(errno, NULL);
@@ -270,6 +292,8 @@ int main(int argc, char **argv) {
     // client
     if (connect(sd, (struct sockaddr *)&sa, sizeof(sa)) == -1)
       err(errno, NULL);
+    oldattr = set_term();
+    thr_arg[2] = &oldattr;
 
     // send wait request
     if ((fp = fopen(filename, "r")) == NULL)
@@ -279,13 +303,12 @@ int main(int argc, char **argv) {
       err(errno, "%s", filename);
     if (!S_ISREG(fileinfo.st_mode))
       errx(EXIT_FAILURE, "%s is not a regular file", filename);
-    printf("send %s to [%s]:%d\n", filename, ip, port);
+    printf(LOG_INFO "Send %s to [%s]:%d\n", filename, ip, port);
     puts(LOG_INFO "Sent WRQ, waiting for respond...");
     write(sd, buf,
           sprintf(buf, "\x02%s %ld %ld", basename(filename), fileinfo.st_size,
                   fileinfo.st_blocks));
 
-    int ref = 0;
     struct timeval tv = {.tv_sec = 1}, tv0 = {}, tv1, tv2;
     struct timespec nt = {};
     setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -307,8 +330,9 @@ int main(int argc, char **argv) {
       if (buf[1] != '0')
         goto invalid;
       puts(LOG_INFO "Server accepted\n");
-      gettimeofday(&tv1, NULL);
       pthread_create(&thr, NULL, thr_func, thr_arg);
+      gettimeofday(&tv1, NULL);
+      // data: 3 blkid ' ' data
       for (blkid = 1; blkid <= fileinfo.st_blocks; blkid++) {
         cnt = sprintf(buf, "\x03%d ", blkid);
         int ret;
@@ -323,6 +347,7 @@ int main(int argc, char **argv) {
           cnt = write(sd, buf, BUFF_LEN);
         while (cnt < 2);
         buf[cnt] = '\0';
+        int ref;
         if (buf[0] == 5) {
           if (buf[1] == 8) {
             paused = 1;
@@ -366,6 +391,7 @@ int main(int argc, char **argv) {
       puts(LOG_WARN "Received invalid response for WRQ from server");
     }
   }
+  tcsetattr(STDIN_FILENO, TCSANOW, &oldattr);
   close(sd);
   fclose(fp);
   return EXIT_SUCCESS;
