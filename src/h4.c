@@ -68,30 +68,25 @@ void updatestatus(int total, int current, int width) {
 }
 
 void *thr_func(void *arg) {
-  char buf[2];
   struct sockaddr_in6 peeraddr = *(struct sockaddr_in6 *)((void **)arg)[1];
   int ch, sd = *(int *)((void **)arg)[0];
   ch = getchar();
   while (ch != 'q') {
     if (ch == 'p') {
-      buf[0] = 5;
-      buf[1] = 8;
-      sendto(sd, buf, 2, 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
+      sendto(sd, "\x05\x08", 2, 0, (struct sockaddr *)&peeraddr,
+             sizeof(peeraddr));
       paused = 1;
       puts(PAUSE);
     } else if (ch == 'r') {
-      buf[0] = 5;
-      buf[1] = 9;
-      sendto(sd, buf, 2, 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
+      sendto(sd, "\x05\x09", 2, 0, (struct sockaddr *)&peeraddr,
+             sizeof(peeraddr));
       paused = 0;
       speed_init = 1;
     }
   }
   paused = 1;
   puts("\n" LOG_WARN "Quitting");
-  buf[0] = 5;
-  buf[1] = 0;
-  sendto(sd, buf, 2, 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
+  sendto(sd, "\x05\0", 2, 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
   exit(0);
 }
 
@@ -319,9 +314,7 @@ int main(int argc, char **argv) {
         int ret;
         if ((ret = fread(buf + cnt, sizeof(char), 512, fp)) == -1) {
           fprintf(stderr, LOG_ERROR "Error in reading from file\n");
-          buf[0] = 5;
-          buf[1] = 3;
-          write(sd, buf, 2);
+          write(sd, "\x05\x03", 2);
           exit(1);
         }
         write(sd, buf, cnt + ret);
