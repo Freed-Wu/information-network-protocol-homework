@@ -20,6 +20,10 @@ bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -lm -o"$bin" && exec ./"$
 #define DEFAULT_PORT 20000
 #define BUFF_LEN 1024
 #define PAUSE "\33[1A\33[2KPAUSED"
+#define LOG_VERBOSE "[\x1B[35m*\x1B[0m] "
+#define LOG_INFO "[\x1B[32m+\x1B[0m] "
+#define LOG_WARN "[\x1B[33m-\x1B[0m] "
+#define LOG_ERROR "[\x1B[31m!\x1B[0m] "
 
 int paused = 0;
 int speed_init = 1;
@@ -83,7 +87,7 @@ void *thr_func(void *arg) {
     }
   }
   paused = 1;
-  puts("\n[\x1B[33m-\x1B[0m] Quitting");
+  puts("\n" LOG_WARN "Quitting");
   buf[0] = 5;
   buf[1] = 0;
   sendto(sd, buf, 2, 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
@@ -164,11 +168,11 @@ int main(int argc, char **argv) {
     // server
     if (bind(sd, (struct sockaddr *)&sa, sizeof(sa)) == -1)
       err(errno, NULL);
-    printf("[\x1B[32m+\x1B[0m] Receive and save file to %s\n", getcwd(NULL, 0));
+    printf(LOG_INFO "Receive and save file to %s\n", getcwd(NULL, 0));
 
     // wait write request
   wrq:
-    puts("[\x1B[32m+\x1B[0m] Waiting for WRQ");
+    puts(LOG_INFO "Waiting for WRQ");
     do
       cnt = recvfrom(sd, buf, BUFF_LEN, 0, (struct sockaddr *)&peer_sa, &len);
     // write request: 2 filename ' ' size ' ' block
@@ -179,8 +183,8 @@ int main(int argc, char **argv) {
     char _filename[256];
     filename = _filename;
     sscanf(buf + 1, "%s %d %d", filename, &size, &totalblk);
-    printf("[\x1B[32m+\x1B[0m] Received WRQ from [%s]:%d\n"
-           "[\x1B[35m*\x1B[0m] Filename: %s Size: %d, accept? (Y/n) ",
+    printf(LOG_INFO "Received WRQ from [%s]:%d\n" LOG_VERBOSE
+                    "Filename: %s Size: %d, accept? (Y/n) ",
            ipstr, ntohs(peer_sa.sin6_port), filename, size);
     if (connect(sd, (struct sockaddr *)&peer_sa, len) == -1)
       err(errno, NULL);
@@ -191,7 +195,7 @@ int main(int argc, char **argv) {
       switch (tolower(getchar())) {
       case 'n':
         // \n is due to (Y/n)
-        printf("\n[\x1B[33m-\x1B[0m] Rejected %s\n", filename);
+        printf("\n" LOG_WARN "Rejected %s\n", filename);
         write(sd, "\x05\x02", 2);
         goto wrq;
       case 'y':
@@ -201,11 +205,11 @@ int main(int argc, char **argv) {
         break;
       default:
         // \n is due to (Y/n)
-        puts("\n[\x1B[31m!\x1B[0m] Please input 'y' or 'n'");
+        puts("\n" LOG_ERROR "Please input 'y' or 'n'");
       }
     }
     // \n is due to (Y/n)
-    printf("\n[\x1B[32m+\x1B[0m] Accepted %s\n", filename);
+    printf("\n" LOG_INFO "Accepted %s\n", filename);
     if ((fp = fopen(filename, "w")) == NULL) {
       write(sd, "\x05\x03", 2);
       err(errno, NULL);
@@ -237,9 +241,9 @@ int main(int argc, char **argv) {
           break;
         default:
           if (buf[1] == 0)
-            puts("[\x1B[33m-\x1B[0m] User cancalled transfer");
+            puts(LOG_WARN "User cancalled transfer");
           else
-            puts("[\x1B[31m!\x1B[0m] Client reports error");
+            puts(LOG_ERROR "Client reports error");
           cont = 0;
         }
         break;
@@ -250,7 +254,7 @@ int main(int argc, char **argv) {
           rcvd_id++;
           char *data = strchr(buf, ' ');
           if (!data++) {
-            puts("[\x1B[33m-\x1B[0m] Received invalid data from client");
+            puts(LOG_WARN "Received invalid data from client");
             continue;
           }
           fwrite(data, sizeof(char), cnt - (data - buf), fp);
@@ -259,7 +263,7 @@ int main(int argc, char **argv) {
         write(sd, buf, sprintf(buf, "\x04%d ", rcvd_id));
         break;
       default:
-        puts("[\x1B[33m-\x1B[0m] Received invalid data from client");
+        puts(LOG_WARN "Received invalid data from client");
       }
       updatestatus(totalblk, rcvd_id, ws.ws_col);
     }
@@ -278,7 +282,7 @@ int main(int argc, char **argv) {
     if (!S_ISREG(fileinfo.st_mode))
       errx(EXIT_FAILURE, "%s is not a regular file", filename);
     printf("send %s to [%s]:%d\n", filename, ip, port);
-    puts("[\x1B[32m+\x1B[0m] Sent WRQ, waiting for respond...");
+    puts(LOG_INFO "Sent WRQ, waiting for respond...");
     write(sd, buf,
           sprintf(buf, "\x02%s %ld %ld", basename(filename), fileinfo.st_size,
                   fileinfo.st_blocks));
@@ -297,21 +301,21 @@ int main(int argc, char **argv) {
     switch (buf[0]) {
     case 5:
       if (buf[1] == 2)
-        puts("[\x1B[33m-\x1B[0m] Server rejected");
+        puts(LOG_WARN "Server rejected");
       else
-        puts("[\x1B[31m!\x1B[0m] Server reports error");
+        puts(LOG_ERROR "Server reports error");
       break;
     case 4:
       if (buf[1] != '0')
         goto invalid;
-      puts("[\x1B[32m+\x1B[0m] Server accepted\n");
+      puts(LOG_INFO "Server accepted\n");
       gettimeofday(&tv1, NULL);
       pthread_create(&thr, NULL, thr_func, thr_arg);
       for (blkid = 1; blkid <= fileinfo.st_blocks; blkid++) {
         cnt = sprintf(buf, "\x03%d ", blkid);
         int ret;
         if ((ret = fread(buf + cnt, sizeof(char), 512, fp)) == -1) {
-          fprintf(stderr, "[\x1B[31m!\x1B[0m] Error in reading from file\n");
+          fprintf(stderr, LOG_ERROR "Error in reading from file\n");
           buf[0] = 5;
           buf[1] = 3;
           write(sd, buf, 2);
@@ -338,9 +342,9 @@ int main(int argc, char **argv) {
             speed_init = 1;
           } else {
             if (buf[1] == 0)
-              puts("[\x1B[33m-\x1B[0m] User cancalled transfer");
+              puts(LOG_WARN "User cancalled transfer");
             else
-              puts("[\x1B[31m!\x1B[0m] Server reports error");
+              puts(LOG_ERROR "Server reports error");
             break;
           }
         }
@@ -363,7 +367,7 @@ int main(int argc, char **argv) {
       break;
     default:
     invalid:
-      puts("[\x1B[33m-\x1B[0m] Received invalid response for WRQ from server");
+      puts(LOG_WARN "Received invalid response for WRQ from server");
     }
   }
   close(sd);
