@@ -7,6 +7,7 @@ bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -o"$bin" && exec ./"$bin"
 #include <errno.h>
 #include <libgen.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,7 +26,7 @@ bin="$(basename "$0")" && bin="${bin%%.*}" && gcc "$0" -o"$bin" && exec ./"$bin"
 #define LOG_WARN "[\x1B[33m-\x1B[0m] "
 #define LOG_ERROR "[\x1B[31m!\x1B[0m] "
 
-int paused = 0;
+bool paused = false;
 int speed_status = 1;
 
 static inline __suseconds_t tvdiff(struct timeval new_tv,
@@ -92,17 +93,17 @@ void *thr_func(void *arg) {
   while ((ch = tolower(getchar())) != 'q') {
     switch (ch) {
     case 'p':
-      paused = 1;
+      paused = true;
       puts(PAUSE);
       write(sd, "\x05\x08", 2);
       break;
     case 'r':
-      paused = 0;
+      paused = false;
       speed_status = 1;
       write(sd, "\x05\x09", 2);
     }
   }
-  paused = 1;
+  paused = true;
   puts("\n" LOG_WARN "Quitting");
   write(sd, "\x05\0", 2);
   struct termios oldattr = *(struct termios *)((void **)arg)[1];
@@ -267,11 +268,11 @@ int main(int argc, char **argv) {
       case 5:
         switch (buf[1]) {
         case 8:
-          paused = 1;
+          paused = true;
           puts(PAUSE);
           break;
         case 9:
-          paused = 0;
+          paused = false;
           speed_status = 1;
           break;
         default:
@@ -368,12 +369,12 @@ int main(int argc, char **argv) {
           case 5:
             switch (buf[1]) {
             case 8:
-              paused = 1;
+              paused = true;
               puts(PAUSE);
               setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
               break;
             case 9:
-              paused = 0;
+              paused = false;
               setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
               gettimeofday(&last_tv, NULL);
               ref = blkid;
