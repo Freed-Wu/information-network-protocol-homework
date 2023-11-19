@@ -39,7 +39,7 @@ void updatestatus(int total, int current, int width) {
   struct timeval t2;
   const char unit[] = " KMGTP";
 
-  if (!((current - 1) % 50))
+  if (!((current - 1) % 50)) {
     if (speed_init == 1) {
       gettimeofday(&t1, NULL);
       speed_init = 2;
@@ -56,6 +56,7 @@ void updatestatus(int total, int current, int width) {
                ((t2.tv_sec - t1.tv_sec) * 1000000 + t2.tv_usec - t1.tv_usec);
       memcpy(&t1, &t2, sizeof(struct timeval));
     }
+  }
 
   for (size_t i = 0; i < barwidth; ++i)
     buf[i] = i < barwidth * current / total ? '#' : ' ';
@@ -103,6 +104,8 @@ int main(int argc, char **argv) {
          "  %1$s recv [ip][:port]",
          argv[0]);
   // parse ip and port
+  // FIXME: https://github.com/llvm/llvm-project/issues/68823
+  // NOLINTNEXTLINE(readability-misleading-indentation)
   int port = DEFAULT_PORT;
   char *ip = NULL;
   if (argc > 2) {
